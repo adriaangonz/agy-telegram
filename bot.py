@@ -6,6 +6,7 @@ import mimetypes
 import os
 import re
 import shutil
+import signal
 import subprocess
 import time
 from datetime import datetime, timedelta
@@ -14,6 +15,7 @@ from pathlib import Path
 import whisper
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ChatAction, ParseMode
+from telegram.error import RetryAfter
 from telegram.ext import (
     Application,
     ApplicationBuilder,
@@ -540,9 +542,27 @@ async def _cancel_running_agy() -> bool:
         return False
     cancel_requested = True
     try:
-        proc.terminate()
+        os.killpg(proc.pid, signal.SIGTERM)
     except ProcessLookupError:
         return False
+    except Exception:
+        try:
+            proc.terminate()
+        except ProcessLookupError:
+            return False
+
+    async def _force_kill_if_needed():
+        await asyncio.sleep(0.6)
+        if proc.returncode is None:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except Exception:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+
+    asyncio.create_task(_force_kill_if_needed())
     return True
 
 
@@ -557,7 +577,15 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data == "cancel_agy":
         ok = await _cancel_running_agy()
-        await query.answer("Cancelando..." if ok else "Ya finalizó.")
+        try:
+            await query.answer("Cancelando..." if ok else "Ya finalizó.")
+        except Exception:
+            pass
+        if ok:
+            try:
+                await query.edit_message_text("❌ Cancelando tarea...")
+            except Exception:
+                pass
         return
 
     if data == "panel_refresh":
@@ -777,6 +805,25 @@ def _build_telegram_prompt(prompt: str, media_info: tuple[str, str] | None = Non
     return f"{header}\n\n{prompt}"
 
 
+def _format_elapsed(seconds: int) -> str:
+    if seconds < 60:
+        return f"{seconds}s"
+    if seconds < 3600:
+        m, s = divmod(seconds, 60)
+        return f"{m}m{s:02d}s"
+    h, rem = divmod(seconds, 3600)
+    m, s = divmod(rem, 60)
+    return f"{h}h{m:02d}m{s:02d}s"
+
+
+def _format_tokens(tokens: int) -> str:
+    if tokens >= 1_000_000:
+        return f"{tokens / 1_000_000:.2f}M"
+    if tokens >= 1000:
+        return f"{tokens / 1000:.1f}k"
+    return str(tokens)
+
+
 async def process_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE, prompt: str, media_info: tuple[str, str] | None = None):
     global force_new_session, current_proc, cancel_requested
 
@@ -789,7 +836,7 @@ async def process_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE, pro
     async with agy_lock:
         cancel_requested = False
         cancel_kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancelar", callback_data="cancel_agy")]])
-        status_msg = await update.message.reply_text("pensando...", reply_markup=cancel_kb)
+        status_msg = await update.message.reply_text("pensando... (0s)", reply_markup=cancel_kb)
 
         full_prompt = _build_telegram_prompt(prompt, media_info=media_info)
 
@@ -797,6 +844,7 @@ async def process_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE, pro
             "agy",
             "--dangerously-skip-permissions",
             "--mode", "auto",
+            "--output-format", "stream-json",
             "--add-dir", str(current_cwd),
             "--add-dir", str(MEDIA_DIR),
             "--add-dir", str(OUTBOX_DIR),
@@ -808,23 +856,46 @@ async def process_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE, pro
         env = _base_env()
         started_at = time.monotonic()
         done_event = asyncio.Event()
+        token_stats = {"input": 0, "output": 0, "total": 0}
 
         async def _progress_ticker():
+            last_text = ""
+            last_typing = 0.0
             while not done_event.is_set():
-                try:
-                    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
-                except Exception:
-                    pass
-                await asyncio.sleep(5)
-                if done_event.is_set():
+                now = time.monotonic()
+                if now - last_typing >= 4.5:
+                    last_typing = now
+                    try:
+                        await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
+                    except Exception:
+                        pass
+
+                await asyncio.sleep(1.0)
+                if done_event.is_set() or cancel_requested:
                     break
-                elapsed = int(time.monotonic() - started_at)
-                try:
-                    await status_msg.edit_text(f"pensando... ({elapsed}s)", reply_markup=cancel_kb)
-                except Exception:
-                    pass
+
+                elapsed_str = _format_elapsed(int(time.monotonic() - started_at))
+                if token_stats["total"] > 0:
+                    status_text = (
+                        f"pensando... ({elapsed_str} | "
+                        f"{_format_tokens(token_stats['total'])} tok: "
+                        f"↓{_format_tokens(token_stats['input'])} ↑{_format_tokens(token_stats['output'])})"
+                    )
+                else:
+                    status_text = f"pensando... ({elapsed_str})"
+
+                if status_text != last_text:
+                    try:
+                        await status_msg.edit_text(status_text, reply_markup=cancel_kb)
+                        last_text = status_text
+                    except RetryAfter as e:
+                        await asyncio.sleep(float(e.retry_after))
+                    except Exception:
+                        pass
 
         ticker_task = asyncio.create_task(_progress_ticker())
+        collected_deltas: list[str] = []
+        final_result_text: str | None = None
 
         try:
             current_proc = await asyncio.create_subprocess_exec(
@@ -833,15 +904,57 @@ async def process_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE, pro
                 env=env,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
+                start_new_session=True,
+                limit=10 * 1024 * 1024,
             )
-            stdout_b, stderr_b = await current_proc.communicate()
+
+            assert current_proc.stdout is not None
+            while True:
+                raw_line = await current_proc.stdout.readline()
+                if not raw_line:
+                    break
+                line = raw_line.decode("utf-8", errors="replace").strip()
+                if not line or not line.startswith("{"):
+                    continue
+                try:
+                    ev = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+
+                ev_type = ev.get("event")
+                if ev_type == "step_update":
+                    su = ev.get("step_update") or {}
+                    if su.get("step_type") == "agent_response" and su.get("text_delta"):
+                        collected_deltas.append(su["text_delta"])
+                    usage = su.get("usage")
+                    if isinstance(usage, dict) and usage.get("total_tokens"):
+                        token_stats["input"] += int(usage.get("input_tokens", 0))
+                        token_stats["output"] += int(usage.get("output_tokens", 0))
+                        token_stats["total"] += int(usage.get("total_tokens", 0))
+                elif ev_type == "result":
+                    res = ev.get("result") or {}
+                    if res.get("response") is not None:
+                        final_result_text = str(res["response"]).strip()
+                    usage = res.get("usage")
+                    if isinstance(usage, dict) and usage.get("total_tokens"):
+                        token_stats["input"] = max(token_stats["input"], int(usage.get("input_tokens", 0)))
+                        token_stats["output"] = max(token_stats["output"], int(usage.get("output_tokens", 0)))
+                        token_stats["total"] = max(token_stats["total"], int(usage.get("total_tokens", 0)))
+
+            stderr_b = await current_proc.stderr.read() if current_proc.stderr else b""
+            await current_proc.wait()
+
             if cancel_requested:
-                output = "Tarea cancelada por el usuario."
+                output = "❌ Tarea cancelada por el usuario."
             else:
                 force_new_session = False
-                stdout_s = stdout_b.decode("utf-8", errors="replace").strip()
                 stderr_s = stderr_b.decode("utf-8", errors="replace").strip()
-                output = stdout_s or stderr_s or "Tarea completada."
+                output = (
+                    final_result_text
+                    or "".join(collected_deltas).strip()
+                    or stderr_s
+                    or "Tarea completada."
+                )
         except Exception as e:
             output = f"Error al ejecutar agy: {e}"
         finally:
@@ -852,6 +965,13 @@ async def process_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE, pro
                 await ticker_task
             except asyncio.CancelledError:
                 pass
+
+        if cancel_requested:
+            try:
+                await status_msg.edit_text("❌ Tarea cancelada por el usuario.")
+            except Exception:
+                await update.message.reply_text("❌ Tarea cancelada por el usuario.")
+            return
 
         try:
             await status_msg.delete()
@@ -1065,6 +1185,7 @@ if __name__ == "__main__":
     app = (
         ApplicationBuilder()
         .token(token)
+        .concurrent_updates(True)
         .post_init(post_init)
         .post_shutdown(post_shutdown)
         .build()
