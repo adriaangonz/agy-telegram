@@ -840,18 +840,19 @@ async def process_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE, pro
 
         full_prompt = _build_telegram_prompt(prompt, media_info=media_info)
 
-        cmd = [
-            "agy",
-            "--dangerously-skip-permissions",
-            "--mode", "auto",
-            "--output-format", "stream-json",
-            "--add-dir", str(current_cwd),
-            "--add-dir", str(MEDIA_DIR),
-            "--add-dir", str(OUTBOX_DIR),
-        ]
-        if not force_new_session:
-            cmd.append("-c")
-        cmd.extend(["-p", full_prompt])
+        def _build_cmd(use_continue: bool) -> list[str]:
+            c = [
+                "agy",
+                "--dangerously-skip-permissions",
+                "--output-format", "stream-json",
+                "--add-dir", str(current_cwd),
+                "--add-dir", str(MEDIA_DIR),
+                "--add-dir", str(OUTBOX_DIR),
+            ]
+            if use_continue:
+                c.append("-c")
+            c.extend(["-p", full_prompt])
+            return c
 
         env = _base_env()
         started_at = time.monotonic()
@@ -894,10 +895,12 @@ async def process_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE, pro
                         pass
 
         ticker_task = asyncio.create_task(_progress_ticker())
-        collected_deltas: list[str] = []
-        final_result_text: str | None = None
 
-        try:
+        async def _exec_once(use_continue: bool) -> tuple[str | None, list[str], str, int | None]:
+            global current_proc
+            deltas: list[str] = []
+            res_text: str | None = None
+            cmd = _build_cmd(use_continue)
             current_proc = await asyncio.create_subprocess_exec(
                 *cmd,
                 cwd=str(current_cwd),
@@ -925,7 +928,7 @@ async def process_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE, pro
                 if ev_type == "step_update":
                     su = ev.get("step_update") or {}
                     if su.get("step_type") == "agent_response" and su.get("text_delta"):
-                        collected_deltas.append(su["text_delta"])
+                        deltas.append(su["text_delta"])
                     usage = su.get("usage")
                     if isinstance(usage, dict) and usage.get("total_tokens"):
                         token_stats["input"] += int(usage.get("input_tokens", 0))
@@ -934,7 +937,7 @@ async def process_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE, pro
                 elif ev_type == "result":
                     res = ev.get("result") or {}
                     if res.get("response") is not None:
-                        final_result_text = str(res["response"]).strip()
+                        res_text = str(res["response"]).strip()
                     usage = res.get("usage")
                     if isinstance(usage, dict) and usage.get("total_tokens"):
                         token_stats["input"] = max(token_stats["input"], int(usage.get("input_tokens", 0)))
@@ -942,18 +945,35 @@ async def process_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE, pro
                         token_stats["total"] = max(token_stats["total"], int(usage.get("total_tokens", 0)))
 
             stderr_b = await current_proc.stderr.read() if current_proc.stderr else b""
-            await current_proc.wait()
+            rc = await current_proc.wait()
+            stderr_lines = [
+                ln for ln in stderr_b.decode("utf-8", errors="replace").splitlines()
+                if ln.strip() and not ln.strip().lower().startswith("warning:")
+            ]
+            return res_text, deltas, "\n".join(stderr_lines).strip(), rc
+
+        try:
+            use_cont = not force_new_session
+            final_result_text, collected_deltas, stderr_s, rc = await _exec_once(use_cont)
+
+            # Retry automatically on transient interruption when no response was produced
+            if not cancel_requested and not final_result_text and not collected_deltas and (rc != 0 or "interrupted" in stderr_s.lower()):
+                for retry_continue in ([use_cont, False] if use_cont else [False]):
+                    await asyncio.sleep(2.0)
+                    if cancel_requested:
+                        break
+                    final_result_text, collected_deltas, stderr_s, rc = await _exec_once(retry_continue)
+                    if final_result_text or collected_deltas:
+                        break
 
             if cancel_requested:
                 output = "❌ Tarea cancelada por el usuario."
             else:
                 force_new_session = False
-                stderr_s = stderr_b.decode("utf-8", errors="replace").strip()
                 output = (
                     final_result_text
                     or "".join(collected_deltas).strip()
-                    or stderr_s
-                    or "Tarea completada."
+                    or "No pude completar la respuesta por una interrupción temporal; inténtalo de nuevo."
                 )
         except Exception as e:
             output = f"Error al ejecutar agy: {e}"
